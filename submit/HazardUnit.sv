@@ -13,6 +13,7 @@ module HazardUnit (
     input CorePack::wb_sel_op_enum wb_sel_EX,
     input CorePack::data_t alu_res_EX,
     input CorePack::addr_t pc_EX,
+    input CorePack::data_t csr_val_EX,
     
     input logic valid_MEM,
     input CorePack::reg_ind_t rd_MEM,
@@ -21,6 +22,7 @@ module HazardUnit (
     input CorePack::data_t alu_res_MEM,
     input CorePack::addr_t pc_MEM,
     input CorePack::data_t mem_read_data_MEM,
+    input CorePack::data_t csr_val_MEM,
     
     input logic valid_WB,
     input CorePack::reg_ind_t rd_WB,
@@ -46,7 +48,7 @@ module HazardUnit (
     assign is_reg_ID    = (inst_ID[6:0] == REG_OPCODE);
     assign is_regw_ID   = (inst_ID[6:0] == REGW_OPCODE);
 
-    assign rs1_use_ID = is_branch_ID | is_load_ID | is_store_ID | is_jalr_ID | is_imm_ID | is_immw_ID | is_reg_ID | is_regw_ID;
+    assign rs1_use_ID = is_branch_ID | is_load_ID | is_store_ID | is_jalr_ID | is_imm_ID | is_immw_ID | is_reg_ID | is_regw_ID | (inst_ID[6:0] == 7'b1110011); // CSR uses rs1 too
     assign rs2_use_ID = is_branch_ID | is_store_ID | is_reg_ID | is_regw_ID;
 
     assign load_use_stall = valid_EX && (wb_sel_EX == WB_SEL_MEM) && rd_EX != 5'b0 && (
@@ -59,6 +61,7 @@ module HazardUnit (
         case(wb_sel_EX)
             WB_SEL_ALU: wb_val_EX = alu_res_EX;
             WB_SEL_PC:  wb_val_EX = pc_EX + 4;
+            WB_SEL0:    wb_val_EX = csr_val_EX;
             default:    wb_val_EX = alu_res_EX;
         endcase
     end
@@ -69,6 +72,7 @@ module HazardUnit (
             WB_SEL_ALU: wb_val_MEM = alu_res_MEM;
             WB_SEL_PC:  wb_val_MEM = pc_MEM + 4;
             WB_SEL_MEM: wb_val_MEM = mem_read_data_MEM;
+            WB_SEL0:    wb_val_MEM = csr_val_MEM;
             default:    wb_val_MEM = alu_res_MEM;
         endcase
     end

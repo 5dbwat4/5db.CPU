@@ -1,4 +1,6 @@
 `include "core_struct.vh"
+`include "csr_struct.vh"
+
 module controller (
     input CorePack::inst_t inst,
     output logic we_reg,
@@ -11,18 +13,28 @@ module controller (
     output CorePack::alu_asel_op_enum alu_asel,
     output CorePack::alu_bsel_op_enum alu_bsel,
     output CorePack::wb_sel_op_enum wb_sel,
-    output CorePack::mem_op_enum mem_op
+    output CorePack::mem_op_enum mem_op,
+
+    // CSR specific outputs
+    output logic we_csr,
+    output logic [1:0] csr_ret,
+    output CsrPack::csr_alu_op_enmu csr_alu_op,
+    output CsrPack::csr_alu_asel_op_enum csr_alu_asel,
+    output CsrPack::csr_alu_bsel_op_enum csr_alu_bsel
 );
 
 import CorePack::*;
+import CsrPack::*;
 
 logic [6:0] opcode;
 logic [2:0] funct3;
 logic [6:0] funct7;
+logic [4:0] rs1;
 
 assign opcode = inst[6:0];
 assign funct3 = inst[14:12];
 assign funct7 = inst[31:25];
+assign rs1    = inst[19:15];
 
 wire is_lui    = (opcode == LUI_OPCODE);
 wire is_auipc  = (opcode == AUIPC_OPCODE);
@@ -36,7 +48,33 @@ wire is_immw   = (opcode == IMMW_OPCODE);
 wire is_reg    = (opcode == REG_OPCODE);
 wire is_regw   = (opcode == REGW_OPCODE);
 
-assign we_reg = is_lui | is_auipc | is_jal | is_jalr | is_load | is_imm | is_immw | is_reg | is_regw;
+wire is_csr = (opcode == CSR_OPCODE);
+
+wire is_system = (opcode == 7'b1110011); // same as CSR_OPCODE
+wire is_csrrw  = is_system && (funct3 == CSRRW_FUNCT3);
+wire is_csrrs  = is_system && (funct3 == CSRRS_FUNCT3);
+wire is_csrrc  = is_system && (funct3 == CSRRC_FUNCT3);
+wire is_csrrwi = is_system && (funct3 == CSRRWI_FUNCT3);
+wire is_csrrsi = is_system && (funct3 == CSRRSI_FUNCT3);
+wire is_csrrci = is_system && (funct3 == CSRRCI_FUNCT3);
+
+wire is_ecall  = is_system && (inst == ECALL);
+wire is_ebreak = is_system && (inst == EBREAK);
+wire is_mret   = is_system && (inst == MRET);
+wire is_sret   = is_system && (inst == SRET);
+
+wire is_csr_inst = is_csrrw | is_csrrs | is_csrrc | is_csrrwi | is_csrrsi | is_csrrci;
+
+// For CSR instructions:
+// we_csr is 1 for CSR instructions except when (rs1 == 0 and operation is RS or RC) 
+// wait, csrrw ALWAYS writes (even if rs1 == 0). csrrs/c don't write if rs1 == 0.
+assign we_csr = is_csrrw | is_csrrwi |
+                ((is_csrrs | is_csrrc | is_csrrsi | is_csrrci) && (rs1 != 5'b0));
+
+assign csr_ret[1] = is_mret;
+assign csr_ret[0] = is_sret;
+
+assign we_reg = is_lui | is_auipc | is_jal | is_jalr | is_load | is_imm | is_immw | is_reg | is_regw | is_csr_inst;
 assign we_mem = is_store;
 assign re_mem = is_load;
 assign npc_sel = is_jal | is_jalr | is_branch;
@@ -52,6 +90,8 @@ always_comb begin
         immgen_op = U_IMM;
     end else if (is_jal) begin
         immgen_op = UJ_IMM;
+    end else if (is_csrrwi || is_csrrsi || is_csrrci) begin
+        immgen_op = CSR_IMM; // wait, is CSR_IMM defined? Let's check. Yes, in CorePack.
     end else begin
         immgen_op = IMM0;
     end
@@ -78,6 +118,8 @@ always_comb begin
         wb_sel = WB_SEL_MEM;
     end else if (is_jal || is_jalr) begin
         wb_sel = WB_SEL_PC;
+    end else if (is_csr_inst) begin
+        wb_sel = WB_SEL0; // Use WB_SEL0 to route csr_val_id
     end else begin
         wb_sel = WB_SEL_ALU;
     end
@@ -160,6 +202,35 @@ always_comb begin
     end else begin
         alu_op = ALU_ADD;
     end
+end
+
+always_comb begin
+    if (is_csrrw || is_csrrwi) begin
+        csr_alu_op = CSR_ALU_ADD;
+    end else if (is_csrrs || is_csrrsi) begin
+        csr_alu_op = CSR_ALU_OR;
+    end else if (is_csrrc || is_csrrci) begin
+        csr_alu_op = CSR_ALU_ANDNOT;
+    end else begin
+        csr_alu_op = CSR_ALU_ADD;
+    end
+end
+
+always_comb begin
+    if (is_csrrwi || is_csrrsi || is_csrrci) begin
+        csr_alu_asel = ASEL_CSR0; // Wait, actually the enum has ASEL_CSR0 and ASEL_CSRREG ? 
+        // We will just use the enum values but evaluate it manually in Core.sv.
+        // Let's say: ASEL_CSR0 = imm, ASEL_CSRREG = rs1.
+        csr_alu_asel = ASEL_CSR0;
+    end else begin
+        csr_alu_asel = ASEL_CSRREG;
+    end
+end
+
+always_comb begin
+    // the enum has BSEL_CSR0, BSEL_GPREG, BSEL_CSRIMM
+    // Actually we just need to pass csr_val.
+    csr_alu_bsel = BSEL_CSR0; 
 end
 
 endmodule

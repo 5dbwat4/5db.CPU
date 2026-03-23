@@ -15,6 +15,7 @@ always_comb begin
         B_IMM:  imm = {{52{inst[31]}}, inst[7], inst[30:25], inst[11:8], 1'b0};
         U_IMM:  imm = {{32{inst[31]}}, inst[31:12], 12'b0};
         UJ_IMM: imm = {{44{inst[31]}}, inst[19:12], inst[20], inst[30:21], 1'b0};
+        CSR_IMM: imm = {59'b0, inst[19:15]};
         default: imm = 64'b0;
     endcase
 end

@@ -1,23 +1,29 @@
 `include "core_struct.vh"
+`include "csr_struct.vh"
 
 module Core (
     input clk,
     input rst,
+    input time_int,
 
     Mem_ift.Master imem_ift,
     Mem_ift.Master dmem_ift,
 
-    output logic cosim_valid,
-    output CorePack::CoreInfo cosim_core_info
+    output cosim_valid,
+    output CorePack::CoreInfo cosim_core_info,
+    output CsrPack::CSRPack cosim_csr_info,
+    output cosim_interrupt,
+    output cosim_switch_mode,
+    output CorePack::data_t cosim_cause
 );
 
     import CorePack::*;
+    import CsrPack::*;
 
     // ========================================================================
     // Memory FSM and Stalls
     // ========================================================================
     
-    // Forward declaration of MEM stage signals
     logic re_mem_MEM, we_mem_MEM, valid_MEM;
     logic mem_stall, if_stall;
 
@@ -32,6 +38,14 @@ module Core (
         .mem_stall(mem_stall),
         .if_stall(if_stall)
     );
+
+    // ========================================================================
+    // CSRModule Signals
+    // ========================================================================
+    
+    logic [1:0] priv;
+    logic switch_mode;
+    data_t pc_csr;
 
     // ========================================================================
     // Pipeline stage signals
@@ -58,11 +72,14 @@ module Core (
     alu_bsel_op_enum alu_bsel_ID;
     wb_sel_op_enum wb_sel_ID;
     mem_op_enum mem_op_ID;
-    logic is_branch_ID, is_load_ID, is_store_ID, is_jalr_ID, is_imm_ID, is_immw_ID, is_reg_ID, is_regw_ID;
-    logic rs1_use_ID, rs2_use_ID;
-    logic load_use_stall;
+    
+    logic we_csr_ID;
+    logic [1:0] csr_ret_ID;
+    csr_alu_op_enmu csr_alu_op_ID;
+    csr_alu_asel_op_enum csr_alu_asel_ID;
+    csr_alu_bsel_op_enum csr_alu_bsel_ID;
 
-    // Forwarding logic
+    logic load_use_stall;
     data_t fw_rs1_data, fw_rs2_data;
 
     // ID/EX register signals
@@ -78,6 +95,14 @@ module Core (
     alu_bsel_op_enum alu_bsel_EX;
     wb_sel_op_enum wb_sel_EX;
     mem_op_enum mem_op_EX;
+    
+    logic we_csr_EX;
+    logic [1:0] csr_ret_EX;
+    csr_alu_op_enmu csr_alu_op_EX;
+    csr_alu_asel_op_enum csr_alu_asel_EX;
+    csr_alu_bsel_op_enum csr_alu_bsel_EX;
+    data_t csr_val_EX;
+    csr_reg_ind_t csr_addr_EX;
 
     // EX stage signals
     data_t alu_a, alu_b, alu_res_EX;
@@ -87,9 +112,10 @@ module Core (
     addr_t target_pc_EX, npc_EX;
     data_t dmem_wdata_EX;
     mask_t dmem_wmask_EX;
+    
+    data_t csr_alu_a, csr_alu_b, csr_alu_res_EX;
 
     // EX/MEM register signals
-    // valid_MEM, re_mem_MEM, we_mem_MEM declared above
     addr_t pc_MEM;
     inst_t inst_MEM;
     reg_ind_t rs1_MEM, rs2_MEM, rd_MEM;
@@ -101,6 +127,12 @@ module Core (
     logic br_taken_MEM;
     addr_t npc_MEM;
     mask_t dmem_wmask_MEM;
+    
+    logic we_csr_MEM;
+    logic [1:0] csr_ret_MEM;
+    data_t csr_alu_res_MEM;
+    csr_reg_ind_t csr_addr_MEM;
+    data_t csr_val_MEM;
 
     // MEM stage signals
     data_t dmem_rdata_MEM, mem_read_data_MEM;
@@ -116,6 +148,12 @@ module Core (
     data_t alu_res_WB, dmem_wdata_WB, mem_rdata_WB, mem_read_data_WB;
     logic br_taken_WB;
     addr_t npc_WB;
+    
+    logic we_csr_WB;
+    logic [1:0] csr_ret_WB;
+    data_t csr_alu_res_WB;
+    csr_reg_ind_t csr_addr_WB;
+    data_t csr_val_WB;
 
     // WB stage signals
     data_t wb_val_WB;
@@ -124,10 +162,13 @@ module Core (
     // IF Stage
     // ========================================================================
 
-    // Fetch Discard Logic
     logic discard_fetch;
     always_ff @(posedge clk) begin
         if (rst) discard_fetch <= 1'b0;
+        else if (switch_mode) begin
+            if (if_stall) discard_fetch <= 1'b1;
+            else discard_fetch <= 1'b0;
+        end
         else if (mem_stall || load_use_stall) discard_fetch <= discard_fetch;
         else if (flush_EX && if_stall) discard_fetch <= 1'b1;
         else if (!if_stall) discard_fetch <= 1'b0;
@@ -136,6 +177,8 @@ module Core (
     always_ff @(posedge clk) begin
         if (rst) begin
             pc <= 64'h0;
+        end else if (switch_mode) begin
+            pc <= pc_csr;
         end else if (mem_stall || load_use_stall) begin
             pc <= pc;
         end else if (flush_EX) begin
@@ -149,12 +192,11 @@ module Core (
         end
     end
 
-    // Safe AXI Address Latch to prevent protocol violation
     logic hold_raddr;
     addr_t latched_raddr;
 
     always_ff @(posedge clk) begin
-        if (rst) begin
+        if (rst || switch_mode) begin
             hold_raddr <= 1'b0;
             latched_raddr <= 64'b0;
         end else begin
@@ -176,7 +218,7 @@ module Core (
     // ========================================================================
 
     always_ff @(posedge clk) begin
-        if (rst) begin
+        if (rst || switch_mode) begin
             valid_ID <= 1'b0;
             pc_ID <= 64'b0;
             inst_ID_reg <= 32'h00000013;
@@ -199,11 +241,15 @@ module Core (
     // ID Stage
     // ========================================================================
 
-    assign inst_ID = valid_ID ? inst_ID_reg : 32'h00000013; // nop if invalid
+    assign inst_ID = valid_ID ? inst_ID_reg : 32'h00000013;
 
     assign rs1_ID = inst_ID[19:15];
     assign rs2_ID = inst_ID[24:20];
     assign rd_ID  = inst_ID[11:7];
+    
+    csr_reg_ind_t csr_addr_ID;
+    assign csr_addr_ID = inst_ID[31:20];
+    data_t csr_val_ID;
 
     controller ctrl (
         .inst(inst_ID),
@@ -217,7 +263,12 @@ module Core (
         .alu_asel(alu_asel_ID),
         .alu_bsel(alu_bsel_ID),
         .wb_sel(wb_sel_ID),
-        .mem_op(mem_op_ID)
+        .mem_op(mem_op_ID),
+        .we_csr(we_csr_ID),
+        .csr_ret(csr_ret_ID),
+        .csr_alu_op(csr_alu_op_ID),
+        .csr_alu_asel(csr_alu_asel_ID),
+        .csr_alu_bsel(csr_alu_bsel_ID)
     );
 
     ImmGen imm_gen_inst (
@@ -238,6 +289,26 @@ module Core (
         .read_data_2(rs2_data_ID)
     );
 
+    ExceptPack except_id;
+    assign except_id = '{except:1'b0, epc:64'b0, ecause:64'h0, etval:64'h0};
+    
+    ExceptPack except_exe;
+    logic except_happen_id;
+    
+    IDExceptExamine id_except_examine (
+        .clk(clk),
+        .rst(rst),
+        .stall(mem_stall || load_use_stall),
+        .flush(flush_EX || switch_mode),
+        .pc_id(pc_ID),
+        .priv(priv),
+        .inst_id(inst_ID),
+        .valid_id(valid_ID),
+        .except_id(except_id),
+        .except_exe(except_exe),
+        .except_happen_id(except_happen_id)
+    );
+
     HazardUnit hazard_unit_inst (
         .inst_ID(inst_ID),
         .rs1_ID(rs1_ID),
@@ -251,6 +322,7 @@ module Core (
         .wb_sel_EX(wb_sel_EX),
         .alu_res_EX(alu_res_EX),
         .pc_EX(pc_EX),
+        .csr_val_EX(csr_val_EX),
         
         .valid_MEM(valid_MEM),
         .rd_MEM(rd_MEM),
@@ -259,6 +331,7 @@ module Core (
         .alu_res_MEM(alu_res_MEM),
         .pc_MEM(pc_MEM),
         .mem_read_data_MEM(mem_read_data_MEM),
+        .csr_val_MEM(csr_val_MEM),
         
         .valid_WB(valid_WB),
         .rd_WB(rd_WB),
@@ -275,7 +348,7 @@ module Core (
     // ========================================================================
 
     always_ff @(posedge clk) begin
-        if (rst) begin
+        if (rst || switch_mode) begin
             valid_EX <= 1'b0;
             pc_EX <= 64'b0;
             inst_EX <= 32'h00000013;
@@ -295,6 +368,14 @@ module Core (
             alu_bsel_EX <= BSEL_REG;
             wb_sel_EX <= WB_SEL_ALU;
             mem_op_EX <= MEM_NO;
+            
+            we_csr_EX <= 1'b0;
+            csr_ret_EX <= 2'b0;
+            csr_alu_op_EX <= CSR_ALU_ADD;
+            csr_alu_asel_EX <= ASEL_CSRREG;
+            csr_alu_bsel_EX <= BSEL_CSR0;
+            csr_val_EX <= 64'b0;
+            csr_addr_EX <= 12'b0;
         end else if (mem_stall) begin
             valid_EX <= valid_EX;
             pc_EX <= pc_EX;
@@ -315,6 +396,14 @@ module Core (
             alu_bsel_EX <= alu_bsel_EX;
             wb_sel_EX <= wb_sel_EX;
             mem_op_EX <= mem_op_EX;
+            
+            we_csr_EX <= we_csr_EX;
+            csr_ret_EX <= csr_ret_EX;
+            csr_alu_op_EX <= csr_alu_op_EX;
+            csr_alu_asel_EX <= csr_alu_asel_EX;
+            csr_alu_bsel_EX <= csr_alu_bsel_EX;
+            csr_val_EX <= csr_val_EX;
+            csr_addr_EX <= csr_addr_EX;
         end else if (flush_EX || load_use_stall) begin
             valid_EX <= 1'b0;
             pc_EX <= 64'b0;
@@ -335,6 +424,14 @@ module Core (
             alu_bsel_EX <= BSEL_REG;
             wb_sel_EX <= WB_SEL_ALU;
             mem_op_EX <= MEM_NO;
+            
+            we_csr_EX <= 1'b0;
+            csr_ret_EX <= 2'b0;
+            csr_alu_op_EX <= CSR_ALU_ADD;
+            csr_alu_asel_EX <= ASEL_CSRREG;
+            csr_alu_bsel_EX <= BSEL_CSR0;
+            csr_val_EX <= 64'b0;
+            csr_addr_EX <= 12'b0;
         end else begin
             valid_EX <= valid_ID;
             pc_EX <= pc_ID;
@@ -355,6 +452,14 @@ module Core (
             alu_bsel_EX <= alu_bsel_ID;
             wb_sel_EX <= wb_sel_ID;
             mem_op_EX <= mem_op_ID;
+            
+            we_csr_EX <= we_csr_ID;
+            csr_ret_EX <= csr_ret_ID;
+            csr_alu_op_EX <= csr_alu_op_ID;
+            csr_alu_asel_EX <= csr_alu_asel_ID;
+            csr_alu_bsel_EX <= csr_alu_bsel_ID;
+            csr_val_EX <= csr_val_ID;
+            csr_addr_EX <= csr_addr_ID;
         end
     end
 
@@ -423,13 +528,45 @@ module Core (
         .dmem_waddr(alu_res_EX),
         .dmem_wmask(dmem_wmask_EX)
     );
+    
+    // CSR ALU
+    always_comb begin
+        case(csr_alu_asel_EX)
+            ASEL_CSR0:   csr_alu_a = imm_EX;
+            ASEL_CSRREG: csr_alu_a = rs1_data_EX;
+            default:     csr_alu_a = rs1_data_EX;
+        endcase
+    end
+    always_comb begin
+        case(csr_alu_bsel_EX)
+            BSEL_CSR0:   csr_alu_b = csr_val_EX;
+            default:     csr_alu_b = csr_val_EX;
+        endcase
+    end
+
+    CSR_ALU csr_alu_inst (
+        .a(csr_alu_a),
+        .b(csr_alu_b),
+        .alu_op(csr_alu_op_EX),
+        .res(csr_alu_res_EX)
+    );
 
     // ========================================================================
     // EX/MEM Register
     // ========================================================================
 
+    ExceptPack except_MEM;
+    ExceptReg exceptreg_MEM (
+        .clk(clk),
+        .rst(rst),
+        .stall(mem_stall),
+        .flush(switch_mode),
+        .except_i(except_exe),
+        .except_o(except_MEM)
+    );
+
     always_ff @(posedge clk) begin
-        if (rst) begin
+        if (rst || switch_mode) begin
             valid_MEM <= 1'b0;
             pc_MEM <= 64'b0;
             inst_MEM <= 32'h00000013;
@@ -448,6 +585,12 @@ module Core (
             br_taken_MEM <= 1'b0;
             npc_MEM <= 64'b0;
             dmem_wmask_MEM <= 8'b0;
+            
+            we_csr_MEM <= 1'b0;
+            csr_ret_MEM <= 2'b0;
+            csr_alu_res_MEM <= 64'b0;
+            csr_addr_MEM <= 12'b0;
+            csr_val_MEM <= 64'b0;
         end else if (mem_stall) begin
             valid_MEM <= valid_MEM;
             pc_MEM <= pc_MEM;
@@ -467,6 +610,12 @@ module Core (
             br_taken_MEM <= br_taken_MEM;
             npc_MEM <= npc_MEM;
             dmem_wmask_MEM <= dmem_wmask_MEM;
+            
+            we_csr_MEM <= we_csr_MEM;
+            csr_ret_MEM <= csr_ret_MEM;
+            csr_alu_res_MEM <= csr_alu_res_MEM;
+            csr_addr_MEM <= csr_addr_MEM;
+            csr_val_MEM <= csr_val_MEM;
         end else begin
             valid_MEM <= valid_EX;
             pc_MEM <= pc_EX;
@@ -486,6 +635,12 @@ module Core (
             br_taken_MEM <= br_taken_EX;
             npc_MEM <= npc_EX;
             dmem_wmask_MEM <= dmem_wmask_EX;
+            
+            we_csr_MEM <= we_csr_EX;
+            csr_ret_MEM <= csr_ret_EX;
+            csr_alu_res_MEM <= csr_alu_res_EX;
+            csr_addr_MEM <= csr_addr_EX;
+            csr_val_MEM <= csr_val_EX;
         end
     end
 
@@ -511,8 +666,18 @@ module Core (
     // MEM/WB Register
     // ========================================================================
 
+    ExceptPack except_WB;
+    ExceptReg exceptreg_WB (
+        .clk(clk),
+        .rst(rst),
+        .stall(mem_stall),
+        .flush(switch_mode),
+        .except_i(except_MEM),
+        .except_o(except_WB)
+    );
+
     always_ff @(posedge clk) begin
-        if (rst) begin
+        if (rst || switch_mode) begin
             valid_WB <= 1'b0;
             pc_WB <= 64'b0;
             inst_WB <= 32'h00000013;
@@ -530,8 +695,14 @@ module Core (
             mem_read_data_WB <= 64'b0;
             br_taken_WB <= 1'b0;
             npc_WB <= 64'b0;
+            
+            we_csr_WB <= 1'b0;
+            csr_ret_WB <= 2'b0;
+            csr_alu_res_WB <= 64'b0;
+            csr_addr_WB <= 12'b0;
+            csr_val_WB <= 64'b0;
         end else if (mem_stall) begin
-            valid_WB <= 1'b0;
+            valid_WB <= 1'b0; // Bubble generated due to stall
         end else begin
             valid_WB <= valid_MEM;
             pc_WB <= pc_MEM;
@@ -550,11 +721,17 @@ module Core (
             mem_read_data_WB <= mem_read_data_MEM;
             br_taken_WB <= br_taken_MEM;
             npc_WB <= npc_MEM;
+            
+            we_csr_WB <= we_csr_MEM;
+            csr_ret_WB <= csr_ret_MEM;
+            csr_alu_res_WB <= csr_alu_res_MEM;
+            csr_addr_WB <= csr_addr_MEM;
+            csr_val_WB <= csr_val_MEM;
         end
     end
 
     // ========================================================================
-    // WB Stage
+    // WB Stage & CSRModule
     // ========================================================================
 
     always_comb begin
@@ -562,14 +739,39 @@ module Core (
             WB_SEL_ALU: wb_val_WB = alu_res_WB;
             WB_SEL_MEM: wb_val_WB = mem_read_data_WB;
             WB_SEL_PC:  wb_val_WB = pc_WB + 4;
+            WB_SEL0:    wb_val_WB = csr_val_WB;
             default:    wb_val_WB = 64'b0;
         endcase
     end
+
+    CSRModule csr_module_inst (
+        .clk(clk),
+        .rst(rst),
+        .csr_we_wb(we_csr_WB && valid_WB),
+        .csr_addr_wb(csr_addr_WB),
+        .csr_val_wb(csr_alu_res_WB),
+        .csr_addr_id(csr_addr_ID),
+        .csr_val_id(csr_val_ID),
+        .pc_ret(npc_WB),
+        .valid_wb(valid_WB),
+        .time_int(time_int),
+        .csr_ret(valid_WB ? csr_ret_WB : 2'b0),
+        .except_commit(except_WB),
+        
+        .priv(priv),
+        .switch_mode(switch_mode),
+        .pc_csr(pc_csr),
+        
+        .cosim_interrupt(cosim_interrupt),
+        .cosim_cause(cosim_cause),
+        .cosim_csr_info(cosim_csr_info)
+    );
 
     // ========================================================================
     // Cosimulation Output
     // ========================================================================
 
+    assign cosim_switch_mode = switch_mode;
     assign cosim_valid = valid_WB;
     
     assign cosim_core_info.pc        = pc_WB;
@@ -587,6 +789,6 @@ module Core (
     assign cosim_core_info.rd_id     = {59'b0, rd_WB}; 
     assign cosim_core_info.rd_data   = wb_val_WB;
     assign cosim_core_info.br_taken  = {63'b0, br_taken_WB};
-    assign cosim_core_info.npc       = npc_WB;
+    assign cosim_core_info.npc       = switch_mode ? pc_csr : npc_WB;
 
 endmodule
