@@ -16,87 +16,22 @@ module Core (
     // ========================================================================
     // Memory FSM and Stalls
     // ========================================================================
-    typedef enum logic [2:0] {
-        IDLE, IF1, IF2, WAITFOR1, WAITFOR2, MEM1, MEM2
-    } state_t;
-
-    state_t state, next_state;
-
-    always_ff @(posedge clk) begin
-        if (rst) state <= IDLE;
-        else state <= next_state;
-    end
-
-    logic i_req_done, i_rep_done;
-    logic d_req_done, d_rep_done;
-
-    assign i_req_done = imem_ift.r_request_valid && imem_ift.r_request_ready;
-    assign i_rep_done = imem_ift.r_reply_valid && imem_ift.r_reply_ready;
-
-    assign d_req_done = (dmem_ift.r_request_valid && dmem_ift.r_request_ready) ||
-                        (dmem_ift.w_request_valid && dmem_ift.w_request_ready);
-    assign d_rep_done = (dmem_ift.r_reply_valid && dmem_ift.r_reply_ready) ||
-                        (dmem_ift.w_reply_valid && dmem_ift.w_reply_ready);
-
+    
     // Forward declaration of MEM stage signals
     logic re_mem_MEM, we_mem_MEM, valid_MEM;
-    logic mem_req;
-    assign mem_req = (re_mem_MEM | we_mem_MEM) && valid_MEM;
-
-    always_comb begin
-        case(state)
-            IDLE: next_state = IF1;
-            IF1: begin
-                if (mem_req) begin
-                    if (i_req_done) next_state = WAITFOR2;
-                    else next_state = WAITFOR1;
-                end else begin
-                    if (i_req_done) next_state = IF2;
-                    else next_state = IF1;
-                end
-            end
-            WAITFOR1: begin
-                if (i_req_done) next_state = WAITFOR2;
-                else next_state = WAITFOR1;
-            end
-            WAITFOR2: begin
-                if (i_rep_done) next_state = MEM1;
-                else next_state = WAITFOR2;
-            end
-            IF2: begin
-                if (i_rep_done) next_state = IDLE;
-                else next_state = IF2;
-            end
-            MEM1: begin
-                if (d_req_done) next_state = MEM2;
-                else next_state = MEM1;
-            end
-            MEM2: begin
-                if (d_rep_done) next_state = IDLE;
-                else next_state = MEM2;
-            end
-            default: next_state = IDLE;
-        endcase
-    end
-
-    assign imem_ift.r_request_valid = (state == IF1) || (state == WAITFOR1);
-    assign imem_ift.r_reply_ready   = (state == IF2) || (state == WAITFOR2);
-
-    assign dmem_ift.r_request_valid = (state == MEM1) && re_mem_MEM && valid_MEM;
-    assign dmem_ift.w_request_valid = (state == MEM1) && we_mem_MEM && valid_MEM;
-    assign dmem_ift.r_reply_ready   = (state == MEM2) && re_mem_MEM;
-    assign dmem_ift.w_reply_ready   = (state == MEM2) && we_mem_MEM;
-    
-    // Unused imem write signals
-    assign imem_ift.w_request_valid = 1'b0;
-    assign imem_ift.w_request_bits.waddr = 64'b0;
-    assign imem_ift.w_request_bits.wdata = 64'b0;
-    assign imem_ift.w_request_bits.wmask = 8'b0;
-    assign imem_ift.w_reply_ready = 1'b0;
-
     logic mem_stall, if_stall;
-    assign mem_stall = mem_req && !(state == MEM2 && d_rep_done);
-    assign if_stall = !( (state == IF2 && i_rep_done) || (state == WAITFOR2 && i_rep_done) );
+
+    MemFSM mem_fsm_inst (
+        .clk(clk),
+        .rst(rst),
+        .imem_ift(imem_ift),
+        .dmem_ift(dmem_ift),
+        .re_mem_MEM(re_mem_MEM),
+        .we_mem_MEM(we_mem_MEM),
+        .valid_MEM(valid_MEM),
+        .mem_stall(mem_stall),
+        .if_stall(if_stall)
+    );
 
     // ========================================================================
     // Pipeline stage signals
@@ -303,66 +238,37 @@ module Core (
         .read_data_2(rs2_data_ID)
     );
 
-    assign is_branch_ID = (inst_ID[6:0] == BRANCH_OPCODE);
-    assign is_load_ID   = (inst_ID[6:0] == LOAD_OPCODE);
-    assign is_store_ID  = (inst_ID[6:0] == STORE_OPCODE);
-    assign is_jalr_ID   = (inst_ID[6:0] == JALR_OPCODE);
-    assign is_imm_ID    = (inst_ID[6:0] == IMM_OPCODE);
-    assign is_immw_ID   = (inst_ID[6:0] == IMMW_OPCODE);
-    assign is_reg_ID    = (inst_ID[6:0] == REG_OPCODE);
-    assign is_regw_ID   = (inst_ID[6:0] == REGW_OPCODE);
-
-    assign rs1_use_ID = is_branch_ID | is_load_ID | is_store_ID | is_jalr_ID | is_imm_ID | is_immw_ID | is_reg_ID | is_regw_ID;
-    assign rs2_use_ID = is_branch_ID | is_store_ID | is_reg_ID | is_regw_ID;
-
-    assign load_use_stall = valid_EX && (wb_sel_EX == WB_SEL_MEM) && rd_EX != 5'b0 && (
-        (rs1_use_ID && rd_EX == rs1_ID) || 
-        (rs2_use_ID && rd_EX == rs2_ID)
+    HazardUnit hazard_unit_inst (
+        .inst_ID(inst_ID),
+        .rs1_ID(rs1_ID),
+        .rs2_ID(rs2_ID),
+        .rs1_data_ID(rs1_data_ID),
+        .rs2_data_ID(rs2_data_ID),
+        
+        .valid_EX(valid_EX),
+        .rd_EX(rd_EX),
+        .we_reg_EX(we_reg_EX),
+        .wb_sel_EX(wb_sel_EX),
+        .alu_res_EX(alu_res_EX),
+        .pc_EX(pc_EX),
+        
+        .valid_MEM(valid_MEM),
+        .rd_MEM(rd_MEM),
+        .we_reg_MEM(we_reg_MEM),
+        .wb_sel_MEM(wb_sel_MEM),
+        .alu_res_MEM(alu_res_MEM),
+        .pc_MEM(pc_MEM),
+        .mem_read_data_MEM(mem_read_data_MEM),
+        
+        .valid_WB(valid_WB),
+        .rd_WB(rd_WB),
+        .we_reg_WB(we_reg_WB),
+        .wb_val_WB(wb_val_WB),
+        
+        .load_use_stall(load_use_stall),
+        .fw_rs1_data(fw_rs1_data),
+        .fw_rs2_data(fw_rs2_data)
     );
-
-    // Forwarding Logic
-    data_t wb_val_EX;
-    always_comb begin
-        case(wb_sel_EX)
-            WB_SEL_ALU: wb_val_EX = alu_res_EX;
-            WB_SEL_PC:  wb_val_EX = pc_EX + 4;
-            default:    wb_val_EX = alu_res_EX;
-        endcase
-    end
-
-    data_t wb_val_MEM;
-    always_comb begin
-        case(wb_sel_MEM)
-            WB_SEL_ALU: wb_val_MEM = alu_res_MEM;
-            WB_SEL_PC:  wb_val_MEM = pc_MEM + 4;
-            WB_SEL_MEM: wb_val_MEM = mem_read_data_MEM;
-            default:    wb_val_MEM = alu_res_MEM;
-        endcase
-    end
-
-    always_comb begin
-        if (valid_EX && we_reg_EX && rd_EX != 5'b0 && rd_EX == rs1_ID && wb_sel_EX != WB_SEL_MEM) begin
-            fw_rs1_data = wb_val_EX;
-        end else if (valid_MEM && we_reg_MEM && rd_MEM != 5'b0 && rd_MEM == rs1_ID) begin
-            fw_rs1_data = wb_val_MEM;
-        end else if (valid_WB && we_reg_WB && rd_WB != 5'b0 && rd_WB == rs1_ID) begin
-            fw_rs1_data = wb_val_WB;
-        end else begin
-            fw_rs1_data = rs1_data_ID;
-        end
-    end
-
-    always_comb begin
-        if (valid_EX && we_reg_EX && rd_EX != 5'b0 && rd_EX == rs2_ID && wb_sel_EX != WB_SEL_MEM) begin
-            fw_rs2_data = wb_val_EX;
-        end else if (valid_MEM && we_reg_MEM && rd_MEM != 5'b0 && rd_MEM == rs2_ID) begin
-            fw_rs2_data = wb_val_MEM;
-        end else if (valid_WB && we_reg_WB && rd_WB != 5'b0 && rd_WB == rs2_ID) begin
-            fw_rs2_data = wb_val_WB;
-        end else begin
-            fw_rs2_data = rs2_data_ID;
-        end
-    end
 
     // ========================================================================
     // ID/EX Register
