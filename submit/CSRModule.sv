@@ -201,7 +201,7 @@ module CSRModule(
     end
     wire [63:0] mstatus={51'b0,mpp_reg,hpp_reg,spp_reg,mpie_reg,hpie_reg,spie_reg,upie_reg,
                 mie_reg,hie_reg,sie_reg,uie_reg};
-    wire [63:0] sstatus={55'b0,spp_reg,2'b0,spie_reg,upie_reg,2'b0,sie_reg,uie_reg};
+    wire [63:0] sstatus={30'b0,2'b10,23'b0,spp_reg,2'b0,spie_reg,upie_reg,2'b0,sie_reg,uie_reg};
 
     ExceptPack except_final;
     reg [63:0] mepc_reg;
